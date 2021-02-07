@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+import PIL.Image as Image
 from torch.nn import functional as F
 from torch import nn
 from torchvision import transforms
@@ -6,9 +8,12 @@ from torch.utils.data import DataLoader
 from pytorch_lightning.core.lightning import LightningModule
 from pytorch_lightning import Trainer
 from torch.optim import Adam
+import pandas as pd 
 import torchvision.datasets as datasets
+from torchvision.datasets import ImageFolder
 import pytorch_lightning as pl
 import shutil
+from sklearn.metrics import classification_report
 import os
 from imutils import paths 
 from os import path
@@ -32,11 +37,57 @@ from pl_bolts.callbacks.ssl_online import SSLOnlineEvaluator
 
 #internal imports
 from transforms_dali import SimCLRTrainDataTransform
+from finetuner_dali_distrib import finetuner
 from encoders_dali import load_encoder
 from ssl_dali_distrib import cli_main, SIMCLR
 from utils import plot_metrics, plot_umap, get_embeddings, n_random_subset, prepare_dataset, class_distrib, farthest_point, min_max_diverse_embeddings, animate, get_embeddings_test
 from cli_main import cli_main
 from TSNE import TSNE_visualiser
+
+
+def generate_classification_report(ckpt,dataset_path,size):
+  
+  model = finetuner.load_from_checkpoint(ckpt)
+  model.eval()
+  model.cuda()
+
+  preds = []
+  labels = []
+  
+  image_size = size
+  t = transforms.Compose([
+    # you can add other transformations in this list
+    transforms.Resize((size,size)),
+    transforms.ToTensor()
+  ])
+  full_ds = ImageFolder(root = dataset_path)
+  full_ds_loader = torch.utils.data.DataLoader(full_ds, batch_size=1,shuffle = False, drop_last=False)
+  files = [full_ds.samples[i][0] for i in range(len(full_ds))]
+  labels = [full_ds.samples[i][1] for i in range(len(full_ds))]
+
+  for f in files:
+    im = Image.open(f).convert('RGB')
+    image = t(im)
+    # im = im.resize((image_size,image_size))
+    # image = np.transpose(im, (2,0,1)).copy()
+    im = torch.tensor(image).unsqueeze(0).float()
+    im = im.cuda()
+
+    with torch.no_grad():
+        probs = model(im)
+        result = torch.argmax(probs, dim = 1)[0].detach().cpu().item()
+        preds.append(result)
+
+  labels_w_names = []
+  preds_w_names = []
+  for i in range(len(labels)):
+    labels_w_names.append(full_ds.classes[labels[i]])
+    preds_w_names.append(full_ds.classes[preds[i]])
+  print('Accuracy:')
+  print(sum(np.array(preds) == np.array(labels))/len(np.array(preds)))
+  print(classification_report(labels_w_names, preds_w_names, full_ds.classes))
+  return classification_report(labels_w_names, preds_w_names, full_ds.classes, output_dict=True)
+
 
 def driver():
 
@@ -95,6 +146,7 @@ def driver():
   # dataset_paths = [pair[0] for pair in val_data.samples]
   # val_loader = DataLoader(val_data, batch_size = batch_size, shuffle=False)
   metric_array = []
+  classification_reports = []
 
   #creating a folder for storing graphs
   try:
@@ -119,12 +171,14 @@ def driver():
       os.mkdir("./graphs/TSNE/DiversityAlgorithm/")
       os.mkdir("./graphs/TSNE/Full_Dataset/")
   
+  
   for i in range(num_iters):
     print("-----------------Iteration: ",i+1,"----------------------")
     ckpt = cli_main(size, buffer_dataset_path, batch_size, num_workers, hidden_dims, epochs, lr, 
-            patience, val_split, withhold, gpus, encoder, log_name, online_eval)
+            patience, val_split, withhold, gpus, encoder, log_name + "_Cycle_"+str(i)+".ckpt", online_eval)
+    print("CHECKPOINT",ckpt)
     encoder = ckpt
-    
+ 
     print("Obtaining Embeddings")
     embedding = get_embeddings_test(encoder, ims, size)
    
@@ -137,6 +191,12 @@ def driver():
     print("New Dataset abiding formats successfully created")
     metric_array.append(class_distrib(buffer_dataset_path, metric= metric))
     
+    print("Running Finetuning...")
+    os.system("python /content/SpaceForceDataSearch/finetuner_dali_distrib.py --DATA_PATH \""+ buffer_dataset_path +"\" --encoder \"" + encoder +"\" --num_workers 2 --log_name \"ft_resnet18_dasubset_cycle_"+str(i)+ "\" --epochs 50 --batch_size 128 --image_size 224")
+
+    print("Generating Classification Report...")
+
+    classification_reports.append(generate_classification_report("./models/FineTune/FineTune_ft_resnet18_dasubset_cycle_"+str(i)+".ckpt","/data/NASA_Rudy/Alphabet_Soup/GRID_A-Z/64",size))
     print("Number and Shape of Embeddings:", len(embedding),embedding[0].shape)
     if umap_exec:
       plot_umap(da_embeddings, da_files, count= i, path="./graphs/UMAP/DiversityAlgorithm/")
@@ -169,6 +229,11 @@ def driver():
     print(metric_array)
     plot_metrics(metric, metric_array)
 
+  complete_report = pd.concat([pd.DataFrame(report).transpose()['f1-score'] for report in classification_reports],axis = 1)
+  complete_report.to_csv('./performance_report_final.csv')
+  metric_report = pd.DataFrame(metric_array)
+  metric_report.to_csv('./class_distrib_report.csv')
+  print(complete_report)
 
 
 if __name__ == "__main__":
