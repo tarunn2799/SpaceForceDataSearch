@@ -112,6 +112,7 @@ def driver():
   parser.add_argument("--metric", default="count", type=str, help="Type of Metric to evaluate pretraining")
   parser.add_argument("--UMAP", default = False, type =bool, help = 'Toggles UMAP plots')
   parser.add_argument("--TSNE", default = False, type= bool, help= 'Toggles TSNE plots' )
+  parser.add_argument("--sampling", default = 'da', type = str, help= 'Select between random sampling or diverse embeddings')
   args = parser.parse_args()
   size = args.image_size
   DATA_PATH = args.DATA_PATH
@@ -133,6 +134,8 @@ def driver():
   metric = args.metric
   umap_exec = args.UMAP
   tsne_exec = args.TSNE
+  sampling = args.sampling
+
   train_image_paths = list(paths.list_images(DATA_PATH))
   random_points_fnames = n_random_subset(subset_size, train_image_paths)
   prepare_dataset(buffer_dataset_path , random_points_fnames)
@@ -141,10 +144,7 @@ def driver():
   for folder in os.listdir(DATA_PATH):
     for im in os.listdir(f'{DATA_PATH}/{folder}'):
       ims.append(f'{DATA_PATH}/{folder}/{im}')
-  # transform = transforms.Compose([transforms.ToTensor(), transforms.Resize([size, size], interpolation=2)])
-  # val_data = datasets.ImageFolder(root=DATA_PATH+'/train', transform=transform) 
-  # dataset_paths = [pair[0] for pair in val_data.samples]
-  # val_loader = DataLoader(val_data, batch_size = batch_size, shuffle=False)
+
   metric_array = []
   classification_reports = []
 
@@ -181,53 +181,76 @@ def driver():
  
     print("Obtaining Embeddings")
     embedding = get_embeddings_test(encoder, ims, size)
-   
-    print("Applying Diversity Algorithm...")
-    da_files, da_embeddings, da_distances = min_max_diverse_embeddings(subset_size, ims,  embedding, i = farthest_point(embedding))
-    
-    print("Preparing New Dataset...")
-    prepare_dataset(buffer_dataset_path, da_files)
-    
-    print("New Dataset abiding formats successfully created")
-    metric_array.append(class_distrib(buffer_dataset_path, metric= metric))
-    
-    print("Running Finetuning...")
-    os.system("python /content/SpaceForceDataSearch/finetuner_dali_distrib.py --DATA_PATH \""+ buffer_dataset_path +"\" --encoder \"" + encoder +"\" --num_workers 2 --log_name \"ft_resnet18_dasubset_cycle_"+str(i)+ "\" --epochs 50 --batch_size 128 --image_size 224")
+    if sampling == 'da':
+      print("Applying Diversity Algorithm...")
+      da_files, da_embeddings, da_distances = min_max_diverse_embeddings(subset_size, ims,  embedding, i = farthest_point(embedding))
+      
+      print("Preparing New Dataset...")
+      prepare_dataset(buffer_dataset_path, da_files)
+      
+      print("New Dataset abiding formats successfully created")
+      metric_array.append(class_distrib(buffer_dataset_path, metric= metric))
+      
+      print("Running Finetuning...")
+      os.system("python /content/SpaceForceDataSearch/finetuner_dali_distrib.py --DATA_PATH \""+ buffer_dataset_path +"\" --encoder \"" + encoder +"\" --num_workers 2 --log_name \"ft_resnet18_dasubset_cycle_"+str(i)+ "\" --epochs 50 --batch_size 128 --image_size 224")
 
-    print("Generating Classification Report...")
+      print("Generating Classification Report...")
 
-    classification_reports.append(generate_classification_report("./models/FineTune/FineTune_ft_resnet18_dasubset_cycle_"+str(i)+".ckpt","/data/NASA_Rudy/Alphabet_Soup/GRID_A-Z/64",size))
-    print("Number and Shape of Embeddings:", len(embedding),embedding[0].shape)
+      classification_reports.append(generate_classification_report("./models/FineTune/FineTune_ft_resnet18_dasubset_cycle_"+str(i)+".ckpt","/data/NASA_Rudy/Alphabet_Soup/GRID_A-Z/64",size))
+      print("Number and Shape of Embeddings:", len(embedding),embedding[0].shape)
+      if umap_exec:
+        plot_umap(da_embeddings, da_files, count= i, path="./graphs/UMAP/DiversityAlgorithm/")
+        plot_umap(embedding, ims, count= i, path="./graphs/UMAP/Full_Dataset/")
+      ##TSNE 
+      if tsne_exec:
+        print("Starting TSNE")
+        da_tsne = TSNE_visualiser(da_embeddings, da_files)
+        full_tsne = TSNE_visualiser(embedding, ims)
+        
+        tsne_results = da_tsne.fit_tsne(da_tsne.feature_list)
+        
+        print('TSNE Full Dataset')
+        full_tsne_results = full_tsne.fit_tsne(full_tsne.feature_list)
+        print("TSNE Fit complete")
+        
+        da_tsne.scatter_plot(tsne_results, da_tsne.labels, "./graphs/TSNE/DiversityAlgorithm/", i)
+        full_tsne.scatter_plot(full_tsne_results, full_tsne.labels, "./graphs/TSNE/Full_Dataset/", i)
+        da_tsne.show_tsne(tsne_results[:, 0], tsne_results[:, 1], da_tsne.filenames, "./graphs/TSNE/DiversityAlgorithm", i)
+        da_tsne.tsne_to_grid_plotter_manual(tsne_results[:, 0], tsne_results[:, 1], da_tsne.filenames, "./graphs/TSNE/DiversityAlgorithm", i)
+        print("TSNE Graphs created and stored")
+    
+    if sampling == 'random':
+      random_files = n_random_subset(subset_size, ims)
+      prepare_dataset(buffer_dataset_path, random_files)
+
+      print("New Dataset abiding formats successfully created")
+      metric_array.append(class_distrib(buffer_dataset_path, metric= metric))
+      
+      print("Running Finetuning...")
+      os.system("python /content/SpaceForceDataSearch/finetuner_dali_distrib.py --DATA_PATH \""+ buffer_dataset_path +"\" --encoder \"" + encoder +"\" --num_workers 2 --log_name \"ft_resnet18_randomsubset_cycle_"+str(i)+ "\" --epochs 50 --batch_size 128 --image_size 224")
+      # print('Skipping Finetuning')
+
+      print("Generating Classification Report...")
+    
+      classification_reports.append(generate_classification_report("./models/FineTune/FineTune_ft_resnet18_randomsubset_cycle_"+str(i)+".ckpt","/data/NASA_Rudy/Alphabet_Soup/GRID_A-Z/64",size))
+      print("Number and Shape of Embeddings:", len(embedding),embedding[0].shape)
+      if umap_exec:
+        plot_umap(embedding, ims, count= i, path="./graphs/UMAP/Full_Dataset/")
+      if tsne_exec:
+        print("Starting TSNE")
+        full_tsne = TSNE_visualiser(embedding, ims)
+        print('TSNE Full Dataset')
+        full_tsne_results = full_tsne.fit_tsne(full_tsne.feature_list)
+        print("TSNE Fit complete")
+        full_tsne.scatter_plot(full_tsne_results, full_tsne.labels, "./graphs/TSNE/Full_Dataset/", i)
+
     if umap_exec:
-      plot_umap(da_embeddings, da_files, count= i, path="./graphs/UMAP/DiversityAlgorithm/")
-      plot_umap(embedding, ims, count= i, path="./graphs/UMAP/Full_Dataset/")
-    ##TSNE 
+      animate("./graphs/UMAP/Full_Dataset",fps=1)
     if tsne_exec:
-      print("Starting TSNE")
-      da_tsne = TSNE_visualiser(da_embeddings, da_files)
-      full_tsne = TSNE_visualiser(embedding, ims)
-      
-      tsne_results = da_tsne.fit_tsne(da_tsne.feature_list)
-      
-      print('TSNE Full Dataset')
-      full_tsne_results = full_tsne.fit_tsne(full_tsne.feature_list)
-      print("TSNE Fit complete")
-      
-      da_tsne.scatter_plot(tsne_results, da_tsne.labels, "./graphs/TSNE/DiversityAlgorithm/", i)
-      full_tsne.scatter_plot(full_tsne_results, full_tsne.labels, "./graphs/TSNE/Full_Dataset/", i)
-      da_tsne.show_tsne(tsne_results[:, 0], tsne_results[:, 1], da_tsne.filenames, "./graphs/TSNE/DiversityAlgorithm", i)
-      da_tsne.tsne_to_grid_plotter_manual(tsne_results[:, 0], tsne_results[:, 1], da_tsne.filenames, "./graphs/TSNE/DiversityAlgorithm", i)
-      print("TSNE Graphs created and stored")
-  
-  if umap_exec:
-    animate("./graphs/UMAP/DiversityAlgorithm", fps = 1)
-    animate("./graphs/UMAP/Full_Dataset",fps=1)
-  if tsne_exec:
-    animate('./graphs/TSNE/DiversityAlgorithm/', fps= 1) 
-    animate("./graphs/TSNE/Full_Dataset/", fps = 1)
-  if metric != "count":
-    print(metric_array)
-    plot_metrics(metric, metric_array)
+      animate("./graphs/TSNE/Full_Dataset/", fps = 1)
+    if metric != "count":
+      print(metric_array)
+      plot_metrics(metric, metric_array)
 
   complete_report = pd.concat([pd.DataFrame(report).transpose()['f1-score'] for report in classification_reports],axis = 1)
   complete_report.to_csv('./performance_report_final.csv')
@@ -238,4 +261,3 @@ def driver():
 
 if __name__ == "__main__":
   driver()
-  
